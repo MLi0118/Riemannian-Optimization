@@ -1,0 +1,1125 @@
+"""
+Riemannian Bilevel Meta-Learning on MiniImageNet
+=================================================
+
+Single-file implementation comparing five hypergradient estimators on a
+5-way 5-shot meta-learning task with Stiefel-constrained backbone:
+
+  Han et al. (2024), "A Framework for Bilevel Optimization on Riemannian
+  Manifolds":
+    - HINV     direct Hessian inverse (with tiny ridge for numerical safety)
+    - CG       conjugate gradient on (H + ridge*I) v = grad_w f
+    - NS       truncated Neumann series  v = alpha * sum_k (I - alpha H)^k g
+    - AD       truncated automatic differentiation through the inner loop
+
+  PL paper:
+    - R-HJFBiO Riemannian Hessian/Jacobian-Free with spectrally-clipped
+               pseudoinverse (kernel-preserving, Morse-Bott consistent)
+
+Setup follows Section 4.2 of the PL paper:
+  - 5-way 5-shot meta-learning
+  - 4-block CNN backbone, 16 channels per layer
+  - First two convolutional kernels constrained to Stiefel manifolds
+        W1 in St(27, 16),   W2 in St(144, 16)
+  - Lower level: ridge-regularized softmax classifier on 400-d features
+  - Three regimes for the lower-level regularizer:
+        strong_convex (lambda = 1e-2),
+        tiny_lam      (lambda = 1e-6),
+        pl_only       (lambda = 0)
+
+Usage
+-----
+    1. Place this script next to the 100 wnid folders (n01532829/, ...).
+    2. python meta_learning_riemannian.py
+    3. First run builds a cache (miniimagenet_cache.pt). Re-runs reuse it.
+    4. Results land in ./results/.
+
+For a fast sanity check, set QUICK_MODE = True at the top. To run only a
+subset of methods or regimes, use the METHODS / REGIMES env vars, e.g.
+    METHODS=hinv,r_hjfbio python meta_learning_riemannian.py
+
+Notes
+-----
+  - Seeded random 64/16/20 class split (not the canonical Ravi-Larochelle
+    splits). Sufficient for an optimization-quality comparison.
+  - The closed-form Hessian of (cross-entropy + L2) is used to avoid
+    the cost of autograd.functional.hessian. eigh is the dominant cost
+    per task at ~1-2 s on Mac CPU, ~50-200 ms on GPU.
+"""
+
+import json
+import os
+import time
+from pathlib import Path
+
+# MPS (Apple Silicon) doesn't yet implement eigh/eigvalsh and several other
+# linalg ops. Enable automatic CPU fallback for those. Conv ops still run
+# on MPS, so we keep the speedup where it matters. Must be set BEFORE
+# `import torch` for it to take effect.
+os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from PIL import Image
+
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+# The script can run as a .py file OR as pasted cells in a Jupyter / Colab
+# notebook. In a notebook __file__ is undefined, so we fall back to:
+#   1. an explicit path in the DATA_ROOT_OVERRIDE env var, if set
+#   2. the standard Colab Drive path if it exists
+#   3. the current working directory
+def _resolve_script_dir():
+    override = os.environ.get("DATA_ROOT_OVERRIDE")
+    if override:
+        return Path(override).expanduser().resolve()
+    try:
+        return Path(__file__).resolve().parent
+    except NameError:
+        # Notebook context. Try Colab default first.
+        colab_default = Path("/content/drive/MyDrive/Colab Notebooks/archive")
+        if colab_default.is_dir():
+            return colab_default
+        return Path.cwd().resolve()
+
+
+SCRIPT_DIR = _resolve_script_dir()
+DATA_ROOT = str(SCRIPT_DIR)
+
+CACHE_PATH = str(SCRIPT_DIR / "miniimagenet_cache.pt")
+RESULTS_DIR = SCRIPT_DIR / "results"
+RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+
+def _pick_device():
+    """CUDA > MPS (Apple Silicon) > CPU. eigh on MPS falls back to CPU
+    automatically in recent PyTorch, so MPS still helps for the conv parts."""
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+
+DEVICE = _pick_device()
+SEED = 42
+
+# ---- Quick-test mode ------------------------------------------------------
+# Toggle True for a fast sanity check (~10-30 min on Mac CPU); False for the
+# full Section-4.2 protocol (~1-3 hours GPU, longer on Mac CPU).
+QUICK_MODE = False
+
+# Few-shot setup (matches the PL paper, Section 4.2)
+N_WAY = 5
+N_SHOT = 5
+N_QUERY = 15
+
+# Outer / inner hyperparameters
+if QUICK_MODE:
+    T_OUTER = 50
+    M_TASKS = 2
+else:
+    T_OUTER = 200      # outer iterations
+    M_TASKS = 4        # meta-batch size
+T_INNER = 30           # inner gradient steps on g (HINV/CG/NS/R-HJFBiO)
+LR_OUTER = 0.05        # Riemannian SGD step on Stiefel
+LR_INNER = 0.1         # Euclidean step for the linear head
+
+# Method-specific hyperparameters
+N_CG = 20                # CG iterations
+RIDGE_FLOOR = 1e-8       # tiny ridge for HINV / CG to avoid LinAlgError
+NS_ALPHA = 5e-2          # Neumann series step (PL paper E.3)
+NS_TERMS = 5             # number of Neumann terms
+AD_INNER = 5             # inner steps with create_graph for AD (PL paper E.3)
+AD_LR = 5e-2             # inner step size for AD
+SPEC_MU_CLIP = 1e-3      # R-HJFBiO: absolute floor in spectral clipping
+                         #   (Algorithm 1 + Section E.3 of the PL paper).
+                         #   Eigenvalues with |lambda| < mu are zeroed
+                         #   (kernel-preserving), rest are inverted up to
+                         #   the empirical max as ceiling Lg.
+
+# Outer-gradient norm cap as a divergence-detection / safety net. If the
+# Riemannian gradient norm exceeds this, the run aborts cleanly with a
+# message rather than letting Inf/NaN propagate into eigh on the next step.
+GRAD_NORM_ABORT = 1e8
+
+# Methods and regimes (overridable via env vars METHODS / REGIMES)
+ALL_METHODS = ["hinv", "rhgd_cg", "ns", "ad", "r_hjfbio"]
+ALL_REGIMES = ["strong_convex", "tiny_lam", "pl_only"]
+METHODS = os.environ.get("METHODS", ",".join(ALL_METHODS)).split(",")
+REGIMES = os.environ.get("REGIMES", ",".join(ALL_REGIMES)).split(",")
+
+# Three lambda regimes
+LAMBDA_REGIMES = {
+    "strong_convex": 1e-2,
+    "tiny_lam": 1e-6,
+    "pl_only": 0.0,
+}
+
+IMAGE_SIZE = 84
+N_CLASSES_TRAIN = 64
+N_CLASSES_VAL = 16
+N_CLASSES_TEST = 20  # 64 + 16 + 20 = 100
+
+# ---------------------------------------------------------------------------
+# Data
+# ---------------------------------------------------------------------------
+
+IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406])
+IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225])
+
+
+def build_or_load_cache(data_root, cache_path, image_size=IMAGE_SIZE,
+                        max_per_class=600):
+    """Walk data_root, resize all images to image_size x image_size, cache as a .pt dict.
+
+    Returns: dict {wnid: torch.uint8 tensor of shape (N, H, W, 3)}.
+    """
+    if os.path.exists(cache_path):
+        print(f"[data] loading cached dataset from {cache_path}")
+        return torch.load(cache_path, map_location="cpu", weights_only=False)
+
+    root = Path(data_root)
+    if not root.is_dir():
+        raise FileNotFoundError(f"DATA_ROOT does not exist: {data_root}")
+
+    classes = sorted([
+        d.name for d in root.iterdir()
+        if d.is_dir() and d.name.startswith("n") and d.name[1:].isdigit()
+    ])
+    print(f"[data] found {len(classes)} class folders, building cache "
+          f"(this may take a few minutes the first time) ...")
+
+    cache = {}
+    for i, cls in enumerate(classes):
+        cls_dir = root / cls
+        paths = sorted([
+            p for p in cls_dir.iterdir()
+            if p.suffix.lower() in (".jpg", ".jpeg", ".png")
+        ])[:max_per_class]
+        imgs = []
+        for p in paths:
+            try:
+                im = Image.open(p).convert("RGB").resize(
+                    (image_size, image_size), Image.BILINEAR)
+                imgs.append(np.asarray(im, dtype=np.uint8))
+            except Exception as e:
+                print(f"  skipping {p}: {e}")
+        if not imgs:
+            print(f"  WARNING: no readable images in {cls_dir}")
+            continue
+        cache[cls] = torch.from_numpy(np.stack(imgs, 0))
+        if (i + 1) % 10 == 0 or i == len(classes) - 1:
+            print(f"  [{i+1}/{len(classes)}] {cls}: {cache[cls].shape[0]} imgs")
+
+    torch.save(cache, cache_path)
+    print(f"[data] saved cache to {cache_path}")
+    return cache
+
+
+def split_classes(class_names, seed=SEED):
+    """Random 64/16/20 train/val/test split."""
+    rng = np.random.default_rng(seed)
+    perm = rng.permutation(len(class_names))
+    classes = [class_names[i] for i in perm]
+    train = classes[:N_CLASSES_TRAIN]
+    val = classes[N_CLASSES_TRAIN:N_CLASSES_TRAIN + N_CLASSES_VAL]
+    test = classes[N_CLASSES_TRAIN + N_CLASSES_VAL:
+                   N_CLASSES_TRAIN + N_CLASSES_VAL + N_CLASSES_TEST]
+    return train, val, test
+
+
+def to_tensor_normalized(uint8_imgs, device):
+    """uint8 (N, H, W, 3) -> float32 (N, 3, H, W), ImageNet-normalized."""
+    x = uint8_imgs.to(device=device, dtype=torch.float32) / 255.0
+    x = x.permute(0, 3, 1, 2).contiguous()
+    mean = IMAGENET_MEAN.to(device).view(1, 3, 1, 1)
+    std = IMAGENET_STD.to(device).view(1, 3, 1, 1)
+    return (x - mean) / std
+
+
+def sample_task(cache, classes, rng, device,
+                n_way=N_WAY, n_shot=N_SHOT, n_query=N_QUERY):
+    """Sample a single 5-way 5-shot/Q-query task."""
+    chosen_idx = rng.choice(len(classes), size=n_way, replace=False)
+    s_imgs, s_labels, q_imgs, q_labels = [], [], [], []
+
+    for new_label, idx in enumerate(chosen_idx):
+        cls = classes[idx]
+        all_imgs = cache[cls]  # (N, H, W, 3) uint8
+        n_total = all_imgs.shape[0]
+        replace = n_total < (n_shot + n_query)
+        picks = rng.choice(n_total, size=n_shot + n_query, replace=replace)
+        s_imgs.append(all_imgs[picks[:n_shot]])
+        q_imgs.append(all_imgs[picks[n_shot:n_shot + n_query]])
+        s_labels.extend([new_label] * n_shot)
+        q_labels.extend([new_label] * n_query)
+
+    s_imgs = to_tensor_normalized(torch.cat(s_imgs, 0), device)
+    q_imgs = to_tensor_normalized(torch.cat(q_imgs, 0), device)
+    s_labels = torch.tensor(s_labels, dtype=torch.long, device=device)
+    q_labels = torch.tensor(q_labels, dtype=torch.long, device=device)
+    return s_imgs, s_labels, q_imgs, q_labels
+
+
+# ---------------------------------------------------------------------------
+# Stiefel utilities
+# ---------------------------------------------------------------------------
+
+def stiefel_init(n, p, generator=None):
+    """Random orthonormal-columns matrix via QR of a Gaussian."""
+    A = torch.randn(n, p, generator=generator)
+    Q, _ = torch.linalg.qr(A)
+    return Q
+
+
+def stiefel_project(W, G):
+    """Project Euclidean gradient G in T_W St (canonical Euclidean metric)."""
+    sym = 0.5 * (W.T @ G + G.T @ W)
+    return G - W @ sym
+
+
+def stiefel_retract(W, V):
+    """QR retraction with sign-fixed diagonal."""
+    Y = W + V
+    Q, R = torch.linalg.qr(Y)
+    d = torch.sign(torch.diag(R))
+    d = torch.where(d == 0, torch.ones_like(d), d)
+    return Q * d.unsqueeze(0)
+
+
+# ---------------------------------------------------------------------------
+# Backbone
+# ---------------------------------------------------------------------------
+
+class StiefelConv4(nn.Module):
+    """4-block CNN with first two conv kernels on Stiefel manifolds.
+
+    Block i: Conv -> BN -> ReLU -> MaxPool(2). All convs are 3x3, padding 1,
+    16 output channels. Input 84x84 -> 5x5 after 4 maxpools, 16 channels =
+    400-d features (matches d=400 in the PL paper).
+
+    Stiefel kernels are stored as the 'columns-per-output-channel' matrix.
+    For block 1: W1 has shape (27, 16)  (3 in_ch * 3 * 3 = 27 -> 16 out_ch).
+    For block 2: W2 has shape (144, 16) (16 in_ch * 3 * 3 = 144 -> 16 out_ch).
+    """
+
+    def __init__(self):
+        super().__init__()
+        gen = torch.Generator().manual_seed(SEED)
+        self.W1 = nn.Parameter(stiefel_init(27, 16, gen))
+        self.W2 = nn.Parameter(stiefel_init(144, 16, gen))
+        self.bn1 = nn.BatchNorm2d(16)
+        self.bn2 = nn.BatchNorm2d(16)
+
+        # Euclidean blocks 3 and 4
+        self.conv3 = nn.Conv2d(16, 16, 3, padding=1)
+        self.conv4 = nn.Conv2d(16, 16, 3, padding=1)
+        self.bn3 = nn.BatchNorm2d(16)
+        self.bn4 = nn.BatchNorm2d(16)
+
+    def forward(self, x):
+        # Block 1: W1 (27, 16) -> kernel (16 out, 3 in, 3, 3)
+        k1 = self.W1.T.reshape(16, 3, 3, 3)
+        x = F.conv2d(x, k1, padding=1)
+        x = F.max_pool2d(F.relu(self.bn1(x)), 2)
+
+        # Block 2: W2 (144, 16) -> kernel (16 out, 16 in, 3, 3)
+        k2 = self.W2.T.reshape(16, 16, 3, 3)
+        x = F.conv2d(x, k2, padding=1)
+        x = F.max_pool2d(F.relu(self.bn2(x)), 2)
+
+        # Block 3, 4: standard Euclidean
+        x = F.max_pool2d(F.relu(self.bn3(self.conv3(x))), 2)
+        x = F.max_pool2d(F.relu(self.bn4(self.conv4(x))), 2)
+
+        return x.flatten(1)  # (N, 400)
+
+    @property
+    def stiefel_params(self):
+        return [self.W1, self.W2]
+
+    @property
+    def euclidean_params(self):
+        return [p for n, p in self.named_parameters()
+                if n not in ("W1", "W2")]
+
+
+# ---------------------------------------------------------------------------
+# Inner-loop solver
+# ---------------------------------------------------------------------------
+
+def inner_solve(features, labels, n_way, lam,
+                n_steps=T_INNER, lr=LR_INNER):
+    """Solve  w* = argmin (1/N) CE(F w, y) + (lam/2) ||w||^2  by GD.
+
+    features: (N, d), labels: (N,) in [0, n_way). Returns w: (d, n_way).
+    Features are treated as constants (detached) inside the inner loop.
+    """
+    d = features.shape[1]
+    w = torch.zeros(d, n_way, device=features.device, dtype=features.dtype,
+                    requires_grad=True)
+    for _ in range(n_steps):
+        logits = features @ w
+        loss = F.cross_entropy(logits, labels) + 0.5 * lam * (w ** 2).sum()
+        (g,) = torch.autograd.grad(loss, w)
+        with torch.no_grad():
+            w = w - lr * g
+        w.requires_grad_(True)
+    return w.detach()
+
+
+# ---------------------------------------------------------------------------
+# Closed-form Hessian of CE + L2  (faster than autograd.functional.hessian)
+# ---------------------------------------------------------------------------
+
+def hessian_w(features, w, lam):
+    """Hessian of  L(w) = (1/N) CE(F w, y) + (lam/2) ||w||^2  w.r.t. w.
+
+    Returns H of shape (d*K, d*K) using *row-major* flatten of w of shape
+    (d, K), i.e. index (j, c) -> j*K + c.
+
+    Derivation: H[(j,c),(j',c')] = (1/N) sum_n F[n,j] F[n,j'] M_n[c,c'] +
+    lam * delta. Here M_n = diag(p_n) - p_n p_n^T, p_n = softmax(F_n^T w).
+    """
+    N, d = features.shape
+    K = w.shape[1]
+    logits = features @ w                      # (N, K)
+    p = torch.softmax(logits, dim=1)           # (N, K)
+    # M[n] = diag(p_n) - p_n p_n^T  ->  (N, K, K)
+    M = torch.diag_embed(p) - p.unsqueeze(2) * p.unsqueeze(1)
+    # H_4d[j, c, j', c'] = (1/N) sum_n F[n,j] F[n,j'] M[n, c, c']
+    H_4d = torch.einsum("nj,nl,ncd->jcld", features, features, M) / N
+    H = H_4d.reshape(d * K, d * K)
+    H = H + lam * torch.eye(d * K, device=H.device, dtype=H.dtype)
+    return H
+
+
+# ---------------------------------------------------------------------------
+# v-solvers: each returns v approximating H^{-1} grad_w f
+# ---------------------------------------------------------------------------
+
+def v_hinv(H, grad_w_f_flat, ridge=RIDGE_FLOOR):
+    """Direct Hessian inverse: solve (H + ridge I) v = grad_w f.
+
+    Han et al.'s HINV strategy. The tiny ridge is a numerical floor so the
+    solve doesn't crash on a literally-singular H; it does NOT regularise
+    the kernel meaningfully (1e-8 amplifies kernel components by 1e8).
+    """
+    n = H.shape[0]
+    A = H + ridge * torch.eye(n, device=H.device, dtype=H.dtype)
+    return torch.linalg.solve(A, grad_w_f_flat)
+
+
+def v_rhgd_cg(H, grad_w_f_flat, n_cg=N_CG, ridge=RIDGE_FLOOR):
+    """Conjugate gradient on (H + ridge I) v = grad_w f.
+
+    Han et al.'s CG strategy. Breaks out on near-zero p^T H p (CG breakdown),
+    which is the failure mode the PL paper documents in the singular regime.
+    """
+    A = H + ridge * torch.eye(H.shape[0], device=H.device, dtype=H.dtype)
+    b = grad_w_f_flat
+    v = torch.zeros_like(b)
+    r = b - A @ v
+    p = r.clone()
+    rs_old = (r * r).sum()
+    for _ in range(n_cg):
+        Ap = A @ p
+        denom = (p * Ap).sum()
+        if denom.abs() < 1e-30:    # CG breakdown
+            break
+        alpha = rs_old / denom
+        v = v + alpha * p
+        r = r - alpha * Ap
+        rs_new = (r * r).sum()
+        if rs_new < 1e-12:
+            break
+        p = r + (rs_new / rs_old) * p
+        rs_old = rs_new
+    return v
+
+
+def v_ns(H, grad_w_f_flat, alpha=NS_ALPHA, n_terms=NS_TERMS):
+    """Truncated Neumann series: v = alpha * sum_{k=0}^{T-1} (I - alpha H)^k g.
+
+    Han et al.'s NS strategy. Equivalent to the recursion
+        q_0 = g, q_{k+1} = q_k - alpha H q_k,  v = alpha * sum q_k.
+    Standard in implicit-MAML-style inverse-Hessian approximations.
+    """
+    q = grad_w_f_flat.clone()
+    v = alpha * q.clone()
+    for _ in range(n_terms - 1):
+        q = q - alpha * (H @ q)
+        v = v + alpha * q
+    return v
+
+
+def v_r_hjfbio(H, grad_w_f_flat, mu=SPEC_MU_CLIP, Lg=None):
+    """Spectrally-clipped Moore-Penrose pseudoinverse times grad_w f.
+
+    Implements the kernel-preserving operator S[mu, Lg] from Eq. (3) of
+    the PL paper: eigenvalues with |lambda| < mu are zeroed; the rest are
+    clamped to [mu, Lg] (sign-preserving). For PSD H (our case) this is
+    just the pseudoinverse on the {eig >= mu} subspace.
+    """
+    eigvals, eigvecs = torch.linalg.eigh(H)
+    if Lg is None:
+        Lg = float(eigvals.abs().max().item())
+    # Kernel: |lambda| < mu -> zero out
+    keep = eigvals.abs() >= mu
+    # For kept eigenvalues, clamp magnitude to [mu, Lg], preserving sign
+    sign = torch.where(eigvals >= 0, torch.ones_like(eigvals),
+                       -torch.ones_like(eigvals))
+    clipped = sign * eigvals.abs().clamp(min=mu, max=Lg)
+    inv = torch.where(keep, 1.0 / clipped, torch.zeros_like(clipped))
+    return eigvecs @ (inv * (eigvecs.T @ grad_w_f_flat))
+
+
+V_SOLVERS = {
+    "hinv": v_hinv,
+    "rhgd_cg": v_rhgd_cg,
+    "ns": v_ns,
+    "r_hjfbio": v_r_hjfbio,
+}
+
+
+# ---------------------------------------------------------------------------
+# Canonical-metric helpers (for the head-to-head plot design)
+# ---------------------------------------------------------------------------
+#
+# Goal: judge every method by the same yardstick rather than by its own
+# self-defined v. Two diagnostics implement this:
+#
+#   1. Canonical hypergradient norm. At each step, for each method, we
+#      assemble a SECOND hypergradient using v_ref (the spectrally-clipped
+#      pinv of the SAME H), then take its Riemannian norm. This is the
+#      gradient we would see if our linear-system solver were perfect.
+#      Method-to-method differences in this column reflect the quality of
+#      each method's TRAJECTORY through Theta-space, not differences in how
+#      they define "the gradient".
+#
+#   2. v-solver relative error on range(H). For each method's actual v_m
+#      vs v_ref, compute ||P_rg(v_m - v_ref)|| / ||P_rg v_ref||, where
+#      P_rg projects onto the span of eigenvectors with |eigenvalue| >=
+#      mu_clip (i.e. range(H) up to spectral clipping). This isolates the
+#      linear-solve quality from the bilevel optimization dynamics.
+#
+# Cost: one extra eigh -> we already do eigvalsh, so eigh has the same
+# leading order; one extra hypergradient assembly per step (~40% overhead
+# on the hypergradient cost).
+
+def assemble_hypergrad(model, feats_s, feats_q, s_y, q_y, w_star, v, lam,
+                       retain_graph=False):
+    """Cross-derivative assembly:  grad_F = grad_Theta f - grad_Theta <grad_w g, v>.
+
+    Linear in v, so we call this twice per step (once with v_m for the
+    actual SGD update, once with v_ref for the canonical diagnostic).
+    Set retain_graph=True on the first of two calls so feats_s/feats_q's
+    autograd graph stays alive for the second.
+    """
+    f_for_outer = F.cross_entropy(feats_q @ w_star, q_y)
+    w_var_g = w_star.clone().requires_grad_(True)
+    g_for_outer = (F.cross_entropy(feats_s @ w_var_g, s_y)
+                   + 0.5 * lam * (w_var_g ** 2).sum())
+    (grad_w_g,) = torch.autograd.grad(g_for_outer, w_var_g, create_graph=True)
+    inner_prod = (grad_w_g * v).sum()
+    total_scalar = f_for_outer - inner_prod
+    grads = torch.autograd.grad(total_scalar, model.parameters(),
+                                allow_unused=True, retain_graph=retain_graph)
+    grads = [torch.zeros_like(p) if g is None else g
+             for p, g in zip(model.parameters(), grads)]
+    return grads
+
+
+def v_ref_via_eigh(eigvals, eigvecs, grad_w_f_flat,
+                   mu=SPEC_MU_CLIP, Lg=None):
+    """Spectrally-clipped pinv applied to grad_w_f_flat. Same definition
+    as v_r_hjfbio but takes precomputed eigh, so we don't redo it."""
+    if Lg is None:
+        Lg = float(eigvals.abs().max().item())
+    keep = eigvals.abs() >= mu
+    sign = torch.where(eigvals >= 0, torch.ones_like(eigvals),
+                       -torch.ones_like(eigvals))
+    clipped = sign * eigvals.abs().clamp(min=mu, max=Lg)
+    inv = torch.where(keep, 1.0 / clipped, torch.zeros_like(clipped))
+    return eigvecs @ (inv * (eigvecs.T @ grad_w_f_flat))
+
+
+def v_rel_err_on_range(v_m_flat, v_ref_flat, eigvals, eigvecs,
+                       mu=SPEC_MU_CLIP):
+    """||P_rg(v_m - v_ref)|| / ||P_rg v_ref||  where P_rg projects onto the
+    span of eigvecs with |eigvalue| >= mu (= range(H) up to spectral
+    clipping). Returns NaN if the reference projection is numerically zero
+    (all of v_ref lives in the kernel)."""
+    keep = eigvals.abs() >= mu
+    coeffs_diff = eigvecs.T @ (v_m_flat - v_ref_flat)
+    coeffs_ref  = eigvecs.T @ v_ref_flat
+    num = float(((coeffs_diff[keep]) ** 2).sum().sqrt().item())
+    den = float(((coeffs_ref[keep]) ** 2).sum().sqrt().item())
+    if den < 1e-30:
+        return float('nan')
+    return num / den
+
+
+# ---------------------------------------------------------------------------
+# Hypergradient on a single task
+# ---------------------------------------------------------------------------
+
+def _diagnostics(feats_q_d, w_d, q_y, eigvals, mu_clip):
+    """Common per-task diagnostic block. Eigvals can be None for AD."""
+    with torch.no_grad():
+        q_logits = feats_q_d @ w_d
+        q_loss = F.cross_entropy(q_logits, q_y).item()
+        q_acc = (q_logits.argmax(1) == q_y).float().mean().item()
+        if eigvals is not None:
+            max_abs = eigvals.abs().max().item()
+            n_kernel = int((eigvals.abs() < mu_clip).sum().item())
+            n_signal = int(eigvals.numel() - n_kernel)
+            kept = eigvals[eigvals.abs() >= mu_clip]
+            min_eig_signal = float(kept.abs().min().item()) if n_signal > 0 else 0.0
+        else:
+            max_abs, n_kernel, n_signal, min_eig_signal = 0.0, 0, 0, 0.0
+    return {
+        "q_loss": q_loss, "q_acc": q_acc,
+        "n_kernel": n_kernel, "n_signal": n_signal,
+        "max_eig": max_abs, "min_eig_signal": min_eig_signal,
+    }
+
+
+def hypergradient_v_based(model, s_x, s_y, q_x, q_y, lam, method,
+                          n_inner=T_INNER, lr_inner=LR_INNER,
+                          mu_clip=SPEC_MU_CLIP):
+    """HINV / CG / NS / R-HJFBiO: solve a linear system for v, then assemble
+    the hypergradient via the standard cross-derivative trick:
+        grad_Theta F = grad_Theta f - grad_Theta <grad_w g, v>.
+
+    Also computes two diagnostic quantities for the head-to-head plot:
+      - canonical hypergradient (uses v_ref instead of v_m); same Theta,
+        same H, but assembled with the gold-standard inverse, giving a
+        common-yardstick gradient norm across methods.
+      - v-solver rel-error on range(H): ||P_rg(v_m - v_ref)|| / ||P_rg v_ref||.
+    """
+    n_way = int(s_y.max().item()) + 1
+
+    # 1. Forward through backbone (graph kept for the outer step)
+    feats_s = model(s_x)
+    feats_q = model(q_x)
+
+    # 2. Inner solve on detached features
+    w_star = inner_solve(feats_s.detach(), s_y, n_way, lam,
+                         n_steps=n_inner, lr=lr_inner)
+
+    feats_s_d = feats_s.detach()
+    feats_q_d = feats_q.detach()
+
+    # 3. grad_w f at w_star
+    w_var = w_star.clone().requires_grad_(True)
+    f_val = F.cross_entropy(feats_q_d @ w_var, q_y)
+    (grad_w_f,) = torch.autograd.grad(f_val, w_var)
+    grad_w_f_flat = grad_w_f.detach().reshape(-1)
+
+    # 4. Hessian (closed form). Compute full eigh now -- needed for v_ref
+    #    and rel-error projection. Same leading cost as eigvalsh.
+    H = hessian_w(feats_s_d, w_star, lam)
+    with torch.no_grad():
+        eigvals, eigvecs = torch.linalg.eigh(H)
+
+    # 5. Solve for v with the chosen method
+    solver = V_SOLVERS[method]
+    v_flat = solver(H, grad_w_f_flat).detach()
+    v = v_flat.reshape(w_star.shape)
+
+    # 6. Reference v from the gold-standard spectrally-clipped pinv. For
+    #    method == "r_hjfbio" this matches v exactly (up to floating point).
+    with torch.no_grad():
+        v_flat_ref = v_ref_via_eigh(eigvals, eigvecs, grad_w_f_flat,
+                                    mu=mu_clip).detach()
+    v_ref = v_flat_ref.reshape(w_star.shape)
+
+    v_rel_err = v_rel_err_on_range(v_flat, v_flat_ref, eigvals, eigvecs,
+                                   mu=mu_clip)
+
+    # 7. Actual hypergradient (used for SGD step). retain_graph=True so
+    #    feats_s/feats_q's graph stays alive for the canonical assembly.
+    grads = assemble_hypergrad(model, feats_s, feats_q, s_y, q_y, w_star,
+                               v, lam, retain_graph=True)
+
+    # 8. Canonical hypergradient (diagnostic only) -- same Theta, same H,
+    #    but with v_ref as the inverse-Hessian estimate.
+    grads_canon = assemble_hypergrad(model, feats_s, feats_q, s_y, q_y,
+                                     w_star, v_ref, lam, retain_graph=False)
+
+    diag = _diagnostics(feats_q_d, w_star, q_y, eigvals, mu_clip)
+    diag["v_rel_err"] = v_rel_err
+    diag["canon_grads"] = [g.detach().clone() for g in grads_canon]
+    return grads, diag
+
+
+def hypergradient_ad(model, s_x, s_y, q_x, q_y, lam,
+                     n_inner_ad=AD_INNER, lr_inner_ad=AD_LR,
+                     mu_clip=SPEC_MU_CLIP):
+    """Han et al.'s AD strategy: keep the inner loop differentiable and
+    backprop through it directly. Doesn't use a v-decomposition.
+
+    Memory-heavier than the v-based path because every inner step's
+    intermediate w is retained in the autograd graph. We therefore truncate
+    to AD_INNER steps (PL paper E.3 uses 5).
+
+    Diagnostics are reported at a converged reference w_ref (T_INNER steps
+    at LR_INNER, matching the v-based methods) so step-0 F is comparable
+    across all five methods. AD's actual hypergradient is unchanged.
+
+    For the v-solver rel-error column, AD has no explicit v_m, so we use
+    the truncated Neumann series with AD's hyperparameters as a proxy.
+    Backprop through n_inner_ad steps of GD is mathematically equivalent
+    (at first order on a quadratic loss) to applying the operator
+    alpha * sum_{k=0}^{n-1} (I - alpha H)^k to grad_w f, with alpha = AD_LR
+    and n = AD_INNER. The proxy is therefore the most principled v-equivalent
+    we can attribute to AD; the rel-error of this proxy is meaningful as
+    "the linear-solve quality implicitly induced by AD's truncation choices".
+    """
+    n_way = int(s_y.max().item()) + 1
+    feats_s = model(s_x)        # graph kept
+    feats_q = model(q_x)        # graph kept
+    d = feats_s.shape[1]
+
+    # AD's actual hypergradient: backprop through truncated unrolled GD.
+    w = torch.zeros(d, n_way, device=feats_s.device, dtype=feats_s.dtype,
+                    requires_grad=True)
+    for _ in range(n_inner_ad):
+        logits = feats_s @ w
+        loss = F.cross_entropy(logits, s_y) + 0.5 * lam * (w ** 2).sum()
+        (g,) = torch.autograd.grad(loss, w, create_graph=True)
+        w = w - lr_inner_ad * g
+    f_unroll = F.cross_entropy(feats_q @ w, q_y)
+    grads = torch.autograd.grad(f_unroll, model.parameters(),
+                                allow_unused=True, retain_graph=True)
+    grads = [torch.zeros_like(p) if g is None else g
+             for p, g in zip(model.parameters(), grads)]
+
+    # Diagnostics at the converged reference w_ref (for step-0 comparability).
+    feats_s_d = feats_s.detach()
+    feats_q_d = feats_q.detach()
+    w_ref = inner_solve(feats_s_d, s_y, n_way, lam,
+                        n_steps=T_INNER, lr=LR_INNER)
+    H = hessian_w(feats_s_d, w_ref, lam)
+    with torch.no_grad():
+        eigvals, eigvecs = torch.linalg.eigh(H)
+
+    # grad_w f at w_ref (separate autograd path for the v-solver comparison)
+    w_var = w_ref.clone().requires_grad_(True)
+    f_at_ref = F.cross_entropy(feats_q_d @ w_var, q_y)
+    (grad_w_f_ref,) = torch.autograd.grad(f_at_ref, w_var)
+    grad_w_f_flat = grad_w_f_ref.detach().reshape(-1)
+
+    with torch.no_grad():
+        v_flat_ref = v_ref_via_eigh(eigvals, eigvecs, grad_w_f_flat,
+                                    mu=mu_clip).detach()
+        v_ref = v_flat_ref.reshape(w_ref.shape)
+        # AD's effective v (Neumann proxy, see docstring).
+        v_flat_m_ad = v_ns(H, grad_w_f_flat,
+                           alpha=AD_LR, n_terms=AD_INNER).detach()
+
+    v_rel_err = v_rel_err_on_range(v_flat_m_ad, v_flat_ref, eigvals, eigvecs,
+                                   mu=mu_clip)
+
+    # Canonical hypergradient at (Theta_t, w_ref) using v_ref. Uses the
+    # live feats_s/feats_q graphs (retained above by retain_graph=True).
+    grads_canon = assemble_hypergrad(model, feats_s, feats_q, s_y, q_y,
+                                     w_ref, v_ref, lam, retain_graph=False)
+
+    diag = _diagnostics(feats_q_d, w_ref, q_y, eigvals, mu_clip)
+    diag["v_rel_err"] = v_rel_err
+    diag["canon_grads"] = [g.detach().clone() for g in grads_canon]
+    return grads, diag
+
+
+def hypergradient_one_task(model, s_x, s_y, q_x, q_y, lam, method):
+    """Dispatch to AD path or v-based path."""
+    if method == "ad":
+        return hypergradient_ad(model, s_x, s_y, q_x, q_y, lam)
+    if method in V_SOLVERS:
+        return hypergradient_v_based(model, s_x, s_y, q_x, q_y, lam, method)
+    raise ValueError(f"unknown method: {method}")
+
+
+# ---------------------------------------------------------------------------
+# Outer training loop
+# ---------------------------------------------------------------------------
+
+def riemannian_sgd_step(model, grads, lr_outer):
+    """Apply Riemannian SGD on Stiefel parameters and Euclidean SGD on the rest."""
+    params = list(model.parameters())
+    stiefel_ids = {id(p) for p in model.stiefel_params}
+    with torch.no_grad():
+        for p, g in zip(params, grads):
+            if id(p) in stiefel_ids:
+                # Project to T_W St, then QR-retract along -lr * g_proj
+                g_proj = stiefel_project(p.data, g)
+                W_new = stiefel_retract(p.data, -lr_outer * g_proj)
+                p.data.copy_(W_new)
+            else:
+                p.data.add_(g, alpha=-lr_outer)
+
+
+def riemannian_grad_norm_sq(model, grads):
+    """Sum of squared Riemannian gradient norms (Stiefel projected, Euclidean as is)."""
+    total = 0.0
+    stiefel_ids = {id(p) for p in model.stiefel_params}
+    with torch.no_grad():
+        for p, g in zip(model.parameters(), grads):
+            if id(p) in stiefel_ids:
+                gp = stiefel_project(p.data, g)
+                total += float((gp ** 2).sum().item())
+            else:
+                total += float((g ** 2).sum().item())
+    return total
+
+
+def run(method, lam, regime_name, cache, train_classes,
+        seed=SEED, t_outer=T_OUTER, m_tasks=M_TASKS):
+    """Train one (method, regime) configuration. Returns trace dict."""
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    rng = np.random.default_rng(seed)
+
+    model = StiefelConv4().to(DEVICE)
+    model.train()
+
+    trace = {
+        "method": method, "lam": lam, "regime": regime_name,
+        "step": [], "q_loss": [], "q_acc": [],
+        "grad_norm_sq": [], "canon_grad_norm_sq": [], "v_rel_err": [],
+        "n_kernel": [], "n_signal": [],
+        "max_eig": [], "min_eig_signal": [], "step_time": [],
+    }
+
+    print(f"\n=== {regime_name}  /  {method}  (lambda = {lam}) ===")
+    t_total0 = time.time()
+    for t in range(t_outer):
+        t0 = time.time()
+        # Accumulate grads across the meta-batch
+        accum = [torch.zeros_like(p) for p in model.parameters()]
+        accum_canon = [torch.zeros_like(p) for p in model.parameters()]
+        diags = []
+        for _ in range(m_tasks):
+            s_x, s_y, q_x, q_y = sample_task(cache, train_classes, rng, DEVICE)
+            grads, diag = hypergradient_one_task(model, s_x, s_y, q_x, q_y,
+                                                 lam, method)
+            for a, g in zip(accum, grads):
+                a.add_(g)
+            for ac, gc in zip(accum_canon, diag["canon_grads"]):
+                ac.add_(gc)
+            diags.append(diag)
+        # Average
+        for a in accum:
+            a.div_(m_tasks)
+        for ac in accum_canon:
+            ac.div_(m_tasks)
+
+        gnorm_sq = riemannian_grad_norm_sq(model, accum)
+        canon_gnorm_sq = riemannian_grad_norm_sq(model, accum_canon)
+
+        # Abort cleanly on divergence rather than crashing inside eigh on the
+        # next step. We treat NaN/Inf in any gradient or a grad-norm above
+        # GRAD_NORM_ABORT as a signal to stop this run and move on. Note:
+        # the divergence check is on the ACTUAL grad norm (which drives the
+        # SGD update), not the canonical one.
+        bad = (not np.isfinite(gnorm_sq)) or gnorm_sq > GRAD_NORM_ABORT or any(
+            (not torch.isfinite(g).all().item()) for g in accum)
+        if bad:
+            print(f"  step {t:3d}  ||grad||^2={gnorm_sq:.3e}  "
+                  f"(divergence detected; aborting this run)")
+            break
+
+        riemannian_sgd_step(model, accum, LR_OUTER)
+
+        # Logging
+        q_loss = float(np.mean([d["q_loss"] for d in diags]))
+        q_acc = float(np.mean([d["q_acc"] for d in diags]))
+        n_kernel = float(np.mean([d["n_kernel"] for d in diags]))
+        n_signal = float(np.mean([d["n_signal"] for d in diags]))
+        max_eig = float(np.mean([d["max_eig"] for d in diags]))
+        min_eig_signal = float(np.mean([d["min_eig_signal"] for d in diags]))
+        v_rel_err_vals = [d["v_rel_err"] for d in diags
+                          if d["v_rel_err"] is not None
+                          and np.isfinite(d["v_rel_err"])]
+        v_rel_err = float(np.mean(v_rel_err_vals)) if v_rel_err_vals else float('nan')
+        dt = time.time() - t0
+        trace["step"].append(t)
+        trace["q_loss"].append(q_loss)
+        trace["q_acc"].append(q_acc)
+        trace["grad_norm_sq"].append(gnorm_sq)
+        trace["canon_grad_norm_sq"].append(canon_gnorm_sq)
+        trace["v_rel_err"].append(v_rel_err)
+        trace["n_kernel"].append(n_kernel)
+        trace["n_signal"].append(n_signal)
+        trace["max_eig"].append(max_eig)
+        trace["min_eig_signal"].append(min_eig_signal)
+        trace["step_time"].append(dt)
+
+        if t % 10 == 0 or t == t_outer - 1:
+            print(f"  step {t:3d}  q_loss={q_loss:.4f}  q_acc={q_acc:.3f}  "
+                  f"||g||^2={gnorm_sq:.3e}  ||g_canon||^2={canon_gnorm_sq:.3e}  "
+                  f"v_err={v_rel_err:.2e}  ({dt:.2f}s/step)")
+    print(f"  total: {time.time() - t_total0:.1f}s")
+    return trace
+
+
+# ---------------------------------------------------------------------------
+# Plotting
+# ---------------------------------------------------------------------------
+
+def plot_results(traces, out_path):
+    """Head-to-head 3-column layout matching the methodology of the v-solver
+    benchmark figure. Rows = lambda regimes, columns:
+
+      Col 0:  Query loss F at (W_t, w_star_t)  -- per-method trajectory.
+      Col 1:  Canonical ||grad F||^2 (common v_ref for all methods)  -- the
+              gradient norm we would see if everyone had a perfect
+              linear-system solver. Method-to-method differences here
+              reflect quality of the Theta trajectory, not differences in
+              gradient definition.
+      Col 2:  v-solver rel-error on range(H), i.e.
+                  ||P_rg(v_m - v_ref)|| / ||P_rg v_ref||
+              with P_rg = projection onto eigenspace of H with |eigval| >=
+              mu_clip. Isolates linear-solve quality from the optimization
+              dynamics. R-HJFBiO sits at machine epsilon by construction
+              (its v_m IS v_ref); other methods reveal their solver bias.
+
+    Aborted runs (divergence-guard tripped) are marked with 'x' at the
+    last logged step on every column. Empty-trace runs (diverged at step
+    0) are silently dropped.
+    """
+    regimes = [r for r in ALL_REGIMES if any(tr["regime"] == r for tr in traces)]
+    methods = [m for m in ALL_METHODS if any(tr["method"] == m for tr in traces)]
+
+    method_colors = {
+        "hinv":     "tab:red",
+        "rhgd_cg":  "tab:orange",
+        "ns":       "tab:purple",
+        "ad":       "tab:green",
+        "r_hjfbio": "tab:blue",
+    }
+    method_label = {
+        "hinv":     "HINV (Han)",
+        "rhgd_cg":  "CG (Han)",
+        "ns":       "NS (Han)",
+        "ad":       "AD (Han)",
+        "r_hjfbio": "R-HJFBiO (ours)",
+    }
+    regime_label = {
+        "strong_convex": r"$\lambda = 10^{-2}$  (strongly convex)",
+        "tiny_lam":      r"$\lambda = 10^{-6}$  (tiny ridge, PL)",
+        "pl_only":       r"$\lambda = 0$  (singular PL)",
+    }
+
+    nrows, ncols = len(regimes), 3
+    fig, axs = plt.subplots(nrows, ncols, figsize=(6.0 * ncols, 4.2 * nrows),
+                            squeeze=False)
+    fig.suptitle(
+        "Head-to-head: R-HJFBiO vs Han et al. (HINV / CG / NS / AD)  on "
+        "MiniImageNet 5-way 5-shot meta-learning",
+        fontsize=13, y=1.00,
+    )
+
+    # Tiny floor for log-scale plotting (replaces zeros / NaNs gracefully)
+    LOG_FLOOR = 1e-16
+
+    # ---- helpers ----------------------------------------------------------
+
+    def get(method, regime):
+        for tr in traces:
+            if tr["method"] == method and tr["regime"] == regime:
+                if len(tr["step"]) == 0:
+                    return None       # diverged at step 0; nothing to plot
+                return tr
+        return None
+
+    def aborted(tr):
+        return 0 < len(tr["step"]) < T_OUTER
+
+    def log_safe(arr, floor=LOG_FLOOR):
+        a = np.array([v if (v is not None and np.isfinite(v)) else floor
+                      for v in arr], dtype=float)
+        return np.maximum(a, floor)
+
+    def mark_abort(ax, tr, ykey, color, log=False):
+        if not aborted(tr) or not tr[ykey]:
+            return
+        x_end = tr["step"][-1]
+        y_end = tr[ykey][-1]
+        if y_end is None or not np.isfinite(y_end):
+            return
+        if log:
+            y_end = max(y_end, LOG_FLOOR)
+        ax.plot([x_end], [y_end], marker="x", color=color, markersize=11,
+                markeredgewidth=2.5, linestyle="None", zorder=20)
+
+    def robust_ylim(panel_traces, key, ymin_floor=None,
+                    p_hi=95, outlier_factor=10.0):
+        """Auto-zoom with single-blow-up clipping (linear-scale panels)."""
+        vals = []
+        for tr in panel_traces:
+            vals.extend(v for v in tr[key]
+                        if v is not None and np.isfinite(v))
+        if not vals:
+            return None, None
+        arr = np.asarray(vals, dtype=float)
+        lo, hi = float(arr.min()), float(arr.max())
+        p95 = float(np.percentile(arr, p_hi))
+        if p95 > 0 and hi > outlier_factor * p95:
+            hi = p95 * 1.3
+        span = hi - lo if hi > lo else max(abs(hi), 1.0) * 0.1
+        ymin = lo - 0.05 * span
+        ymax = hi + 0.05 * span
+        if ymin_floor is not None:
+            ymin = max(ymin, ymin_floor)
+        return ymin, ymax
+
+    # ---- panels -----------------------------------------------------------
+
+    for j, r in enumerate(regimes):
+        regime_traces = [get(m, r) for m in methods if get(m, r) is not None]
+
+        # Col 0: query loss F (linear y-axis, clipping outliers)
+        ax = axs[j, 0]
+        for m in methods:
+            tr = get(m, r)
+            if tr is None:
+                continue
+            ax.plot(tr["step"], tr["q_loss"], color=method_colors[m],
+                    label=method_label[m], alpha=0.9)
+            mark_abort(ax, tr, "q_loss", method_colors[m])
+        ax.set_title(f"$F$ at $(W_t, w_t)$  |  {regime_label[r]}")
+        ax.set_xlabel("outer step")
+        ax.set_ylabel(r"$F(W_t, w_t)$")
+        ymin, ymax = robust_ylim(regime_traces, "q_loss", ymin_floor=0)
+        if ymin is not None:
+            ax.set_ylim(ymin, ymax)
+        ax.grid(alpha=0.3)
+        if j == 0:
+            ax.plot([], [], marker="x", color="k", linestyle="None",
+                    markersize=9, markeredgewidth=2,
+                    label="aborted (divergence)")
+            ax.legend(fontsize=8, loc="upper right")
+
+        # Col 1: canonical hypergradient norm squared (log y)
+        ax = axs[j, 1]
+        for m in methods:
+            tr = get(m, r)
+            if tr is None:
+                continue
+            y = log_safe(tr["canon_grad_norm_sq"])
+            ax.plot(tr["step"], y, color=method_colors[m],
+                    label=method_label[m], alpha=0.9)
+            mark_abort(ax, tr, "canon_grad_norm_sq", method_colors[m], log=True)
+        ax.set_title(rf"Canonical $\|\mathrm{{grad}}\,F(W_t)\|^2$  "
+                     rf"(common $v_\mathrm{{ref}}$)  |  {regime_label[r]}")
+        ax.set_xlabel("outer step")
+        ax.set_yscale("log")
+        ax.grid(alpha=0.3, which="both")
+
+        # Col 2: v-solver rel-error on range(H) (log y)
+        ax = axs[j, 2]
+        for m in methods:
+            tr = get(m, r)
+            if tr is None:
+                continue
+            y = log_safe(tr["v_rel_err"])
+            ax.plot(tr["step"], y, color=method_colors[m],
+                    label=method_label[m], alpha=0.9)
+            mark_abort(ax, tr, "v_rel_err", method_colors[m], log=True)
+        ax.set_title(rf"$v$-solver rel-error on range$(H)$  |  {regime_label[r]}")
+        ax.set_xlabel("outer step")
+        ax.set_ylabel(r"$\|P_\mathrm{rg}(v_m - v^*)\| / \|P_\mathrm{rg} v^*\|$")
+        ax.set_yscale("log")
+        ax.grid(alpha=0.3, which="both")
+
+    plt.tight_layout(rect=[0, 0, 1, 0.99])
+    plt.savefig(out_path, dpi=130, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[plot] saved {out_path}")
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main():
+    print(f"[setup] device = {DEVICE}")
+    print(f"[setup] seed = {SEED}")
+    print(f"[setup] QUICK_MODE = {QUICK_MODE}  "
+          f"(T_OUTER={T_OUTER}, M_TASKS={M_TASKS})")
+    print(f"[setup] methods = {METHODS}")
+    print(f"[setup] regimes = {REGIMES}")
+
+    cache = build_or_load_cache(DATA_ROOT, CACHE_PATH)
+
+    classes = sorted(cache.keys())
+    if len(classes) < 100:
+        print(f"WARNING: only {len(classes)} classes in cache "
+              f"(MiniImageNet expects 100); continuing anyway.")
+
+    train_classes, val_classes, test_classes = split_classes(classes, seed=SEED)
+    print(f"[setup] train/val/test class split: "
+          f"{len(train_classes)}/{len(val_classes)}/{len(test_classes)}")
+
+    traces = []
+    n_runs = sum(1 for r in REGIMES if r in LAMBDA_REGIMES) * len(METHODS)
+    run_idx = 0
+    for regime in REGIMES:
+        if regime not in LAMBDA_REGIMES:
+            print(f"  skipping unknown regime: {regime}")
+            continue
+        lam = LAMBDA_REGIMES[regime]
+        for method in METHODS:
+            if method not in ALL_METHODS:
+                print(f"  skipping unknown method: {method}")
+                continue
+            run_idx += 1
+            print(f"\n[run {run_idx}/{n_runs}]")
+            tr = run(method, lam, regime, cache, train_classes)
+            traces.append(tr)
+            # Save intermediate JSON after each run
+            out_json = RESULTS_DIR / f"trace_{regime}_{method}.json"
+            with open(out_json, "w") as f:
+                json.dump(tr, f, indent=2)
+
+    # Aggregate plot
+    plot_results(traces, RESULTS_DIR / "comparison.png")
+
+    # Summary print
+    print("\n=== Final-step summary ===")
+    print(f"{'regime':<16} {'method':<12} {'steps':>6} {'q_loss':>10} "
+          f"{'q_acc':>8} {'||g||^2':>12} {'||g_canon||^2':>14} "
+          f"{'v_rel_err':>11} {'ker H':>7}")
+    for tr in traces:
+        if len(tr["step"]) == 0:
+            print(f"{tr['regime']:<16} {tr['method']:<12} {0:>6} "
+                  f"{'(diverged at step 0)':>40}")
+            continue
+        n_steps = len(tr["step"])
+        diverged = " *" if n_steps < T_OUTER else ""
+        v_err = tr["v_rel_err"][-1]
+        v_err_s = f"{v_err:>11.2e}" if (v_err is not None and np.isfinite(v_err)) else f"{'nan':>11}"
+        print(f"{tr['regime']:<16} {tr['method']:<12} {n_steps:>6} "
+              f"{tr['q_loss'][-1]:>10.4f} {tr['q_acc'][-1]:>8.3f} "
+              f"{tr['grad_norm_sq'][-1]:>12.3e} "
+              f"{tr['canon_grad_norm_sq'][-1]:>14.3e} "
+              f"{v_err_s} {tr['n_kernel'][-1]:>7.0f}"
+              f"{diverged}")
+    print("(* = aborted before T_OUTER due to divergence; "
+          "see trace_*.json for the partial trajectory)")
+
+
+if __name__ == "__main__":
+    main()
