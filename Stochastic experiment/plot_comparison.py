@@ -16,6 +16,8 @@ the range cluster.
 For column 3 we re-run a single trajectory per (manifold, method) and at
 each outer iteration compute || v_method - H^+ grad_y f || / || H^+ grad_y f ||
 where H^+ is the threshold-pseudoinverse with rcond = 1e-8.
+
+Output: one figure per manifold (3 separate PNGs of shape 1x3).
 """
 import os
 import numpy as np
@@ -31,7 +33,7 @@ from han_baselines import (RHGD, STRATEGIES,
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 TRAJ = os.path.join(HERE, "results", "comparison.npz")
-SAVE = os.path.join(HERE, "results", "comparison.png")
+SAVE_DIR = os.path.join(HERE, "results")
 
 MANIFOLDS = ["stiefel", "grassmann", "hyperbolic"]
 METHODS   = ["R-HJFBiO", "HINV", "CG", "NS", "AD"]
@@ -306,6 +308,68 @@ def replay_for_ref_gnorm(mname, meth, X_tr, y_tr, X_val, y_val):
 
 
 # --------------------------------------------------------------------------
+def plot_one_manifold(mname, data, quality, ref_gn):
+    """Render a single 1x3 figure for the given manifold and save it.
+
+    Returns the saved path.
+    """
+    fig, axes = plt.subplots(1, 3, figsize=(17, 4.2))
+    ax_F, ax_gT, ax_q = axes
+
+    for meth in METHODS:
+        F_arr = np.stack(collect(data, mname, meth, "F_actual"))
+        it_arr = collect(data, mname, meth, "iters")[0]
+
+        # Col 1: F at method's own (W_t, y_t)
+        ax_F.plot(it_arr, F_arr.mean(0),
+                  color=COLORS[meth], ls=LINESTYLES[meth],
+                  lw=LINEWIDTHS[meth], label=meth, alpha=0.95)
+
+        # Col 2: CANONICAL Riemannian hypergradient norm
+        it_r, gn_r = ref_gn[mname][meth]
+        ax_gT.plot(it_r, gn_r,
+                   color=COLORS[meth], ls=LINESTYLES[meth],
+                   lw=LINEWIDTHS[meth], label=meth, alpha=0.95)
+
+        # Col 3: v-solver quality (range-restricted relative error)
+        it_q, err_q = quality[mname][meth]
+        ax_q.semilogy(it_q, np.maximum(err_q, 1e-16),
+                      color=COLORS[meth], ls=LINESTYLES[meth],
+                      lw=LINEWIDTHS[meth], label=meth, alpha=0.95)
+
+    ax_F.set_title(f"{DISPLAY[mname]}: $F$ at $(W_t, y_t)$")
+    ax_F.set_xlabel("outer iteration $t$")
+    ax_F.set_ylabel(r"$f(W_t, y_t)$ on $D_{val}$")
+    ax_F.grid(alpha=0.25)
+    ax_F.legend(loc="upper right", fontsize=9, frameon=True,
+                framealpha=0.9, ncol=1)
+
+    ax_gT.set_title(r"Canonical $\|\mathrm{grad}\, F(W_t)\|_x$ "
+                    r"(common $v_{\mathrm{ref}}$ for all methods)")
+    ax_gT.set_xlabel("outer iteration $t$")
+    ax_gT.set_ylabel(r"$\|\mathrm{grad}\, F\|_x$ via spectrally-clipped pinv")
+    ax_gT.set_yscale("log")
+    ax_gT.grid(alpha=0.25, which="both")
+
+    ax_q.set_title(r"$v$-solver rel-error on $\mathrm{range}(H)$")
+    ax_q.set_xlabel("outer iteration $t$")
+    ax_q.set_ylabel(r"$\|P_{\mathrm{rg}}(v_{\mathrm{m}} - v^\star)\| / \|P_{\mathrm{rg}} v^\star\|$")
+    ax_q.grid(alpha=0.25, which="both")
+    ax_q.axhline(1.0, color="gray", lw=0.8, alpha=0.5)
+
+    fig.suptitle(
+        f"R-HJFBiO vs Han et al. (HINV / CG / NS / AD) on {DISPLAY[mname]}  "
+        "-- UCI Superconductivity, PL regime  "
+        "(d = 70, |D$_{tr}$| = 40, full-batch deterministic)",
+        y=1.02, fontsize=11)
+    fig.tight_layout()
+    save = os.path.join(SAVE_DIR, f"comparison_{mname}.png")
+    fig.savefig(save, dpi=140, bbox_inches="tight")
+    plt.close(fig)
+    return save
+
+
+# --------------------------------------------------------------------------
 def main():
     data = np.load(TRAJ)
 
@@ -329,65 +393,13 @@ def main():
                   f"ref-gnorm[0]={gn0:.3f}  ref-gnorm[end]={gn_r[-1]:.3f}")
 
     # ----------------------------------------------------------------
-    # Plot: 3 rows (manifolds) x 3 cols (F_actual, canonical gnorm, v-quality)
-    fig, axes = plt.subplots(3, 3, figsize=(17, 11))
-
-    for row, mname in enumerate(MANIFOLDS):
-        ax_F  = axes[row, 0]
-        ax_gT = axes[row, 1]
-        ax_q  = axes[row, 2]
-
-        for meth in METHODS:
-            F_arr = np.stack(collect(data, mname, meth, "F_actual"))
-            it_arr = collect(data, mname, meth, "iters")[0]
-
-            # Col 1: F at method's own (W_t, y_t)
-            ax_F.plot(it_arr, F_arr.mean(0),
-                      color=COLORS[meth], ls=LINESTYLES[meth],
-                      lw=LINEWIDTHS[meth], label=meth, alpha=0.95)
-
-            # Col 2: CANONICAL Riemannian hypergradient norm
-            #        (method-agnostic, same yardstick for every method)
-            it_r, gn_r = ref_gn[mname][meth]
-            ax_gT.plot(it_r, gn_r,
-                       color=COLORS[meth], ls=LINESTYLES[meth],
-                       lw=LINEWIDTHS[meth], label=meth, alpha=0.95)
-
-            # Col 3: v-solver quality (how close is method's v to v_ref on range(H))
-            it_q, err_q = quality[mname][meth]
-            ax_q.semilogy(it_q, np.maximum(err_q, 1e-16),
-                          color=COLORS[meth], ls=LINESTYLES[meth],
-                          lw=LINEWIDTHS[meth], label=meth, alpha=0.95)
-
-        ax_F.set_title(f"{DISPLAY[mname]}: $F$ at $(W_t, y_t)$")
-        ax_F.set_xlabel("outer iteration $t$")
-        ax_F.set_ylabel(r"$f(W_t, y_t)$ on $D_{val}$")
-        ax_F.grid(alpha=0.25)
-        if row == 0:
-            ax_F.legend(loc="upper right", fontsize=9, frameon=True,
-                        framealpha=0.9, ncol=1)
-
-        ax_gT.set_title(r"Canonical $\|\mathrm{grad}\, F(W_t)\|_x$ "
-                        r"(common $v_{\mathrm{ref}}$ for all methods)")
-        ax_gT.set_xlabel("outer iteration $t$")
-        ax_gT.set_ylabel(r"$\|\mathrm{grad}\, F\|_x$ via spectrally-clipped pinv")
-        ax_gT.set_yscale("log")
-        ax_gT.grid(alpha=0.25, which="both")
-
-        ax_q.set_title(r"$v$-solver rel-error on $\mathrm{range}(H)$")
-        ax_q.set_xlabel("outer iteration $t$")
-        ax_q.set_ylabel(r"$\|P_{\mathrm{rg}}(v_{\mathrm{m}} - v^\star)\| / \|P_{\mathrm{rg}} v^\star\|$")
-        ax_q.grid(alpha=0.25, which="both")
-        ax_q.axhline(1.0, color="gray", lw=0.8, alpha=0.5)
-
-    fig.suptitle(
-        "Head-to-head: R-HJFBiO vs Han et al. (HINV / CG / NS / AD)  "
-        "on UCI Superconductivity in the PL regime  "
-        "(d = 70, |D$_{tr}$| = 40, full-batch deterministic)",
-        y=0.995, fontsize=12)
-    fig.tight_layout(rect=[0, 0, 1, 0.985])
-    fig.savefig(SAVE, dpi=140, bbox_inches="tight")
-    print(f"\nSaved {SAVE}")
+    # One 1x3 figure per manifold, saved separately.
+    print()
+    saved_paths = []
+    for mname in MANIFOLDS:
+        path = plot_one_manifold(mname, data, quality, ref_gn)
+        saved_paths.append(path)
+        print(f"Saved {path}")
 
     # Final summary
     print("\nFinal-iterate summary (mean over 3 seeds):")
@@ -402,7 +414,8 @@ def main():
             print(f"{mname:12s} {meth:10s} {np.mean(Fs):10.4f} "
                   f"{gn_ref_final:14.3e} {err_med:16.3e}")
 
+    return saved_paths
+
 
 if __name__ == "__main__":
     main()
-
